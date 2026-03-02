@@ -4,6 +4,12 @@ import json
 import re
 from typing import Dict, Optional
 
+try:
+    from fastapi import FastAPI, File, Form, UploadFile
+except ImportError:  # pragma: no cover
+    FastAPI = None  # type: ignore
+    File = Form = UploadFile = None  # type: ignore
+
 from services.common.db import DEFAULT_DB_PATH, get_conn, init_db
 
 PARSER_VERSION = "1.0.0"
@@ -46,6 +52,47 @@ def _heuristic_parse(text: str, attachment_name: str, mime_type: str) -> Dict[st
     }
 
 
+def _parse_blob(blob: bytes, attachment_name: str, mime_type: str) -> Dict[str, Optional[str]]:
+    if mime_type == "application/pdf" or attachment_name.lower().endswith(".pdf"):
+        text = _extract_text_from_pdf(blob)
+    else:
+        text = _extract_text_from_image(blob)
+    return _heuristic_parse(text, attachment_name, mime_type)
+
+
+def parse_and_store_attachment(
+    blob: bytes,
+    attachment_name: str,
+    mime_type: str,
+    db_path: str,
+    sender: Optional[str] = None,
+    subject: Optional[str] = None,
+    source_message_id: Optional[str] = None,
+) -> Dict[str, int]:
+    parsed_json = _parse_blob(blob, attachment_name, mime_type)
+
+    with get_conn(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO raw_receipts (
+                message_id, sender, subject, attachment_name, mime_type, attachment_blob, status
+            ) VALUES (?, ?, ?, ?, ?, ?, 'parsed')
+            """,
+            (source_message_id, sender, subject, attachment_name, mime_type, blob),
+        )
+        raw_receipt_id = int(cursor.lastrowid)
+
+        parsed_cursor = conn.execute(
+            """
+            INSERT INTO parsed_receipts (raw_receipt_id, parser_version, parsed_json)
+            VALUES (?, ?, ?)
+            """,
+            (raw_receipt_id, PARSER_VERSION, json.dumps(parsed_json)),
+        )
+
+    return {"raw_receipt_id": raw_receipt_id, "parsed_receipt_id": int(parsed_cursor.lastrowid)}
+
+
 def parse_pending_receipts(db_path: str) -> int:
     parsed_count = 0
     with get_conn(db_path) as conn:
@@ -59,12 +106,7 @@ def parse_pending_receipts(db_path: str) -> int:
         ).fetchall()
 
         for row in pending:
-            if row["mime_type"] == "application/pdf" or row["attachment_name"].lower().endswith(".pdf"):
-                text = _extract_text_from_pdf(row["attachment_blob"])
-            else:
-                text = _extract_text_from_image(row["attachment_blob"])
-
-            parsed = _heuristic_parse(text, row["attachment_name"], row["mime_type"])
+            parsed = _parse_blob(row["attachment_blob"], row["attachment_name"], row["mime_type"])
             conn.execute(
                 """
                 INSERT INTO parsed_receipts (raw_receipt_id, parser_version, parsed_json)
@@ -85,6 +127,41 @@ def parse_pending_receipts(db_path: str) -> int:
     return parsed_count
 
 
+def create_app(db_path: str = DEFAULT_DB_PATH):
+    if FastAPI is None:
+        raise RuntimeError("fastapi is required to run the HTTP parser service")
+
+    app = FastAPI(title="Receipt Parse Service")
+
+    @app.on_event("startup")
+    def startup() -> None:
+        init_db(db_path)
+
+    @app.post("/parse/receipt")
+    async def parse_receipt(
+        file: UploadFile = File(...),
+        sender: Optional[str] = Form(default=None),
+        subject: Optional[str] = Form(default=None),
+        source_message_id: Optional[str] = Form(default=None),
+    ) -> Dict[str, int]:
+        blob = await file.read()
+        return parse_and_store_attachment(
+            blob=blob,
+            attachment_name=file.filename or "uploaded_receipt",
+            mime_type=file.content_type or "application/octet-stream",
+            db_path=db_path,
+            sender=sender,
+            subject=subject,
+            source_message_id=source_message_id,
+        )
+
+    @app.get("/health")
+    def health() -> Dict[str, str]:
+        return {"status": "ok"}
+
+    return app
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Service 2: parse receipt files and store JSON")
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
@@ -97,6 +174,8 @@ def main() -> None:
     count = parse_pending_receipts(args.db_path)
     print(f"Parsed {count} receipt(s) and stored JSON in parsed_receipts")
 
+
+app = create_app() if FastAPI is not None else None
 
 if __name__ == "__main__":
     main()
